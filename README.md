@@ -19,5 +19,5 @@
 3. **安装必要的 Python 库**：
    打开终端并运行以下命令：
    ```bash
-   pip install pygame keyboard
+   pip install pygame pynput
    ```
