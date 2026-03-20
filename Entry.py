@@ -3,13 +3,21 @@ from tkinter import filedialog, messagebox
 from tkinter import ttk
 import pygame
 import pygame._sdl2.audio as sdl2_audio
-import keyboard
+from pynput import keyboard
 import json
 import os
 import random
 import threading
 
+import sys
 CONFIG_FILE = "soundboard_config.json"
+def get_resource_path(relative_path):
+
+    if hasattr(sys, '_MEIPASS'):
+
+        return os.path.join(sys._MEIPASS, relative_path)
+
+    return os.path.join(os.path.abspath("."), relative_path)
 
 
 class GameMusicPlayer:
@@ -28,21 +36,20 @@ class GameMusicPlayer:
         }
         self.temp_filepaths = []
 
+
+        self.current_pressed = set()
+        self.hotkey_states = {}
+        self.is_recording = False
+
         self.load_config()
         self.init_audio_mixer()
-        self.set_window_icon()
         self.setup_ui()
         self.update_volume_setting()
         self.refresh_treeview()
-        self.register_hotkeys()
 
-    def set_window_icon(self):
-        if os.path.exists("logo.png"):
-            try:
-                self.icon_image = tk.PhotoImage(file="logo.png")
-                self.root.iconphoto(True, self.icon_image)
-            except:
-                pass
+        self.start_global_listener()
+
+
 
     def init_audio_mixer(self):
         if pygame.mixer.get_init():
@@ -56,6 +63,55 @@ class GameMusicPlayer:
             pygame.mixer.init()
             pygame.mixer.music.set_volume(self.config_data["volume"])
 
+    def key_to_str(self, key):
+
+        if hasattr(key, 'vk') and key.vk is not None:
+            if 96 <= key.vk <= 105:
+                return f"numpad_{key.vk - 96}"
+
+        if hasattr(key, 'char') and key.char:
+            return str(key.char).lower()
+
+        if hasattr(key, 'name') and key.name:
+            name = str(key.name).replace("_l", "").replace("_r", "")
+            return name
+
+        return str(key)
+
+    def start_global_listener(self):
+        def on_press(key):
+            key_str = self.key_to_str(key)
+            self.current_pressed.add(key_str)
+            self.check_hotkeys()
+
+        def on_release(key):
+            key_str = self.key_to_str(key)
+            if key_str in self.current_pressed:
+                self.current_pressed.remove(key_str)
+            for hotkey in self.hotkey_states:
+                if hotkey not in self.current_pressed:
+                    self.hotkey_states[hotkey] = False
+
+        self.listener = keyboard.Listener(on_press=on_press, on_release=on_release)
+        self.listener.start()
+
+    def check_hotkeys(self):
+
+        if self.is_recording: return
+
+        for hotkey, files in self.config_data["bindings"].items():
+            target_keys = set(hotkey.split('+'))
+
+            if target_keys.issubset(self.current_pressed):
+
+                if not self.hotkey_states.get(hotkey, False):
+                    self.hotkey_states[hotkey] = True
+                    self.root.after(0, self.play_or_stop, hotkey)
+            else:
+                self.hotkey_states[hotkey] = False
+
+    # =======================================================
+
     def setup_ui(self):
         top_frame = tk.Frame(self.root, pady=10)
         top_frame.pack(fill=tk.X, padx=10)
@@ -63,7 +119,7 @@ class GameMusicPlayer:
         tk.Label(top_frame, text="快捷键:").grid(row=0, column=0, sticky=tk.W)
 
         self.hotkey_var = tk.StringVar()
-        self.entry_hotkey = tk.Entry(top_frame, textvariable=self.hotkey_var, width=12, state='readonly')
+        self.entry_hotkey = tk.Entry(top_frame, textvariable=self.hotkey_var, width=15, state='readonly')
         self.entry_hotkey.grid(row=0, column=1, padx=5)
 
         self.btn_capture = tk.Button(top_frame, text="⌨️ 录制", command=self.start_capture, bg="#e2e3e5")
@@ -75,7 +131,7 @@ class GameMusicPlayer:
         self.btn_bind = tk.Button(top_frame, text="➕ 绑定", command=self.add_binding, bg="#d4edda")
         self.btn_bind.grid(row=0, column=4, padx=5)
 
-        self.btn_delete = tk.Button(top_frame, text="🗑️ 删除", command=self.delete_binding, bg="#f8d7da")
+        self.btn_delete = tk.Button(top_frame, text="🗑️ 删除整条", command=self.delete_binding, bg="#f8d7da")
         self.btn_delete.grid(row=0, column=5, padx=5)
 
         self.btn_settings = tk.Button(top_frame, text="⚙️ 设 置", command=self.open_settings, bg="#cce5ff")
@@ -118,13 +174,76 @@ class GameMusicPlayer:
         columns = ("hotkey", "count", "paths")
         self.tree = ttk.Treeview(list_frame, columns=columns, show="headings")
         self.tree.heading("hotkey", text="快捷键")
-        self.tree.heading("count", text="数量")
+        self.tree.heading("count", text="数量 (双击管理)")
         self.tree.heading("paths", text="文件路径摘要")
 
-        self.tree.column("hotkey", width=100, anchor=tk.CENTER)
-        self.tree.column("count", width=50, anchor=tk.CENTER)
+        self.tree.column("hotkey", width=120, anchor=tk.CENTER)
+        self.tree.column("count", width=120, anchor=tk.CENTER)
         self.tree.column("paths", width=350, anchor=tk.W)
         self.tree.pack(fill=tk.BOTH, expand=True)
+
+        self.tree.bind("<Double-1>", self.open_song_manager)
+
+    def open_song_manager(self, event):
+        selected = self.tree.selection()
+        if not selected: return
+
+        hotkey = str(self.tree.item(selected[0])['values'][0])
+        files = self.config_data["bindings"].get(hotkey, [])
+        if not files: return
+
+        manager_win = tk.Toplevel(self.root)
+        manager_win.title(f"管理音效 - 快捷键: {hotkey}")
+
+        win_width, win_height = 500, 300
+        manager_win.transient(self.root)
+        self.root.update_idletasks()
+        pos_x = self.root.winfo_x() + (self.root.winfo_width() // 2) - (win_width // 2)
+        pos_y = self.root.winfo_y() + (self.root.winfo_height() // 2) - (win_height // 2)
+        manager_win.geometry(f"{win_width}x{win_height}+{pos_x}+{pos_y}")
+        manager_win.grab_set()
+
+        if hasattr(self, 'icon_image'):
+            try:
+                manager_win.iconphoto(False, self.icon_image)
+            except:
+                pass
+
+        tk.Label(manager_win, text=f"当前【{hotkey}】绑定的所有音效文件：").pack(pady=5)
+
+        frame = tk.Frame(manager_win)
+        frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+
+        scrollbar = tk.Scrollbar(frame)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        listbox = tk.Listbox(frame, yscrollcommand=scrollbar.set, width=60, selectbackground="#007bff")
+        for f in files: listbox.insert(tk.END, f)
+        listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.config(command=listbox.yview)
+
+        def delete_selected_song():
+            selected_idx = listbox.curselection()
+            if not selected_idx:
+                messagebox.showwarning("提示", "请先在列表中点击选中要删除的歌曲！", parent=manager_win)
+                return
+
+            idx = selected_idx[0]
+            song_path = listbox.get(idx)
+
+            self.config_data["bindings"][hotkey].remove(song_path)
+            listbox.delete(idx)
+
+            if len(self.config_data["bindings"][hotkey]) == 0:
+                del self.config_data["bindings"][hotkey]
+                messagebox.showinfo("提示", "该快捷键下已无音效，快捷键已被移除。", parent=manager_win)
+                manager_win.destroy()
+
+            self.save_config()
+            self.refresh_treeview()
+
+        btn_del = tk.Button(manager_win, text="🗑️ 删除选中的这首歌", command=delete_selected_song, bg="#f8d7da")
+        btn_del.pack(pady=10)
 
     def open_settings(self):
         settings_win = tk.Toplevel(self.root)
@@ -197,15 +316,28 @@ class GameMusicPlayer:
     def start_capture(self):
         self.btn_capture.config(text="🔴 请按下组合键...", state=tk.DISABLED, bg="#ffc107")
         self.hotkey_var.set("")
+        self.is_recording = True
 
         def worker():
-            hotkey = keyboard.read_hotkey(suppress=False)
-            self.root.after(0, self.finish_capture, hotkey)
+            recorded = set()
+
+            def on_press(key):
+                recorded.add(self.key_to_str(key))
+
+            def on_release(key):
+                return False
+
+            with keyboard.Listener(on_press=on_press, on_release=on_release) as l:
+                l.join()
+
+            hotkey_str = '+'.join(recorded)
+            self.root.after(0, self.finish_capture, hotkey_str)
 
         threading.Thread(target=worker, daemon=True).start()
 
     def finish_capture(self, hotkey):
-        if hotkey != 'esc':
+        self.is_recording = False  # 解除录制状态锁
+        if hotkey and 'esc' not in hotkey:
             self.hotkey_var.set(hotkey)
         self.btn_capture.config(text="⌨️ 录制", state=tk.NORMAL, bg="#e2e3e5")
 
@@ -238,18 +370,19 @@ class GameMusicPlayer:
 
         self.save_config()
         self.refresh_treeview()
-        self.register_hotkeys()
 
     def delete_binding(self):
         selected = self.tree.selection()
-        if not selected: return
+        if not selected:
+            messagebox.showwarning("提示", "请先在下方列表中点击选中一条记录！")
+            return
 
-        hotkey = self.tree.item(selected)['values'][0]
+        hotkey = str(self.tree.item(selected[0])['values'][0])
         if hotkey in self.config_data["bindings"]:
-            del self.config_data["bindings"][hotkey]
-            self.save_config()
-            self.refresh_treeview()
-            self.register_hotkeys()
+            if messagebox.askyesno("确认删除", f"确定要删除快捷键【{hotkey}】及其绑定的所有音效吗？"):
+                del self.config_data["bindings"][hotkey]
+                self.save_config()
+                self.refresh_treeview()
 
     def play_or_stop(self, hotkey):
         if pygame.mixer.music.get_busy():
@@ -266,14 +399,6 @@ class GameMusicPlayer:
                     pygame.mixer.music.play()
                 except:
                     pass
-
-    def register_hotkeys(self):
-        keyboard.unhook_all()
-        for hotkey in self.config_data["bindings"].keys():
-            try:
-                keyboard.add_hotkey(hotkey, lambda hk=hotkey: self.play_or_stop(hk))
-            except:
-                pass
 
     def save_config(self):
         if not hasattr(self, 'root'): return
@@ -309,5 +434,7 @@ class GameMusicPlayer:
 
 if __name__ == "__main__":
     root = tk.Tk()
+    img = tk.PhotoImage(file=get_resource_path("logo.png"))
+    root.iconphoto(False, img)
     app = GameMusicPlayer(root)
     root.mainloop()
